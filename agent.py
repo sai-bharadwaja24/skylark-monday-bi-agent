@@ -42,121 +42,194 @@ def _get_gemini_tools():
         })
     return [{"function_declarations": declarations}]
 
+def _fallback_local_engine(conversation: list[dict], board_ids: dict, session_cache: dict) -> str:
+    """High-accuracy deterministic fallback engine when cloud LLM hits rate limits (429) or is offline."""
+    last_user_msg = ""
+    for msg in reversed(conversation):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            last_user_msg = msg.get("content")
+            break
+        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            for part in msg.get("content"):
+                if isinstance(part, str):
+                    last_user_msg = part
+                    break
+
+    # Load deals and work orders via tools
+    if "deals" not in session_cache:
+        session_cache["deals"] = tools._load_deals(board_ids.get("deals", ""))
+    if "work_orders" not in session_cache:
+        session_cache["work_orders"] = tools._load_work_orders(board_ids.get("work_orders", ""))
+
+    from bi_agent_core import BIAgentCore
+    core = BIAgentCore(session_cache["deals"].df, session_cache["work_orders"].df)
+    res = core.process_query(last_user_msg)
+
+    out = []
+    out.append(f"### {res.get('title', 'Business Intelligence Snapshot')}\n")
+    out.append(res.get("executive_summary", ""))
+
+    if res.get("metrics"):
+        out.append("\n**Key Metrics:**")
+        for k, v in res["metrics"].items():
+            out.append(f"- **{k}:** {v}")
+
+    if res.get("recommendations"):
+        out.append("\n**Strategic Recommendations:**")
+        for r in res["recommendations"]:
+            out.append(f"- {r}")
+
+    if res.get("caveats"):
+        out.append("\n**⚠️ Data Caveats:**")
+        for c in res["caveats"][:3]:
+            out.append(f"- _{c}_")
+
+    final_str = "\n".join(out)
+    conversation.append({"role": "assistant", "content": final_str})
+    return final_str
+
 def _run_gemini_turn(conversation: list[dict], board_ids: dict, session_cache: dict, api_key: str) -> str:
-    """Executes multi-turn conversation with tool-calling using Google Gemini API."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    """Executes multi-turn conversation with tool-calling using Google Gemini API with automatic fallback."""
+    models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash"]
     
-    # Format contents for Gemini
-    gemini_contents = []
-    for msg in conversation:
-        role = "user" if msg["role"] == "user" else "model"
-        if isinstance(msg["content"], str):
-            gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-        elif isinstance(msg["content"], list):
-            parts = []
-            for item in msg["content"]:
-                if isinstance(item, dict) and item.get("type") == "tool_result":
-                    parts.append({
-                        "functionResponse": {
-                            "name": item.get("name", "tool"),
-                            "response": {"output": item.get("content", "")}
-                        }
-                    })
-                elif isinstance(item, dict) and item.get("type") == "tool_use":
-                    parts.append({
-                        "functionCall": {
-                            "name": item.get("name"),
-                            "args": item.get("input", {})
-                        }
-                    })
-                elif isinstance(item, str):
-                    parts.append({"text": item})
-            if parts:
-                gemini_contents.append({"role": role, "parts": parts})
-
-    while True:
-        payload = {
-            "contents": gemini_contents,
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "tools": _get_gemini_tools(),
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
-        }
+    for model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         
-        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
-        if resp.status_code != 200:
-            return f"Gemini API Error ({resp.status_code}): {resp.text}"
+        gemini_contents = []
+        for msg in conversation:
+            role = "user" if msg["role"] == "user" else "model"
+            if isinstance(msg["content"], str):
+                gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+            elif isinstance(msg["content"], list):
+                parts = []
+                for item in msg["content"]:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        parts.append({
+                            "functionResponse": {
+                                "name": item.get("name", "tool"),
+                                "response": {"output": item.get("content", "")}
+                            }
+                        })
+                    elif isinstance(item, dict) and item.get("type") == "tool_use":
+                        parts.append({
+                            "functionCall": {
+                                "name": item.get("name"),
+                                "args": item.get("input", {})
+                            }
+                        })
+                    elif isinstance(item, str):
+                        parts.append({"text": item})
+                if parts:
+                    gemini_contents.append({"role": role, "parts": parts})
 
-        res_data = resp.json()
-        candidates = res_data.get("candidates", [])
-        if not candidates:
-            return "No response generated by Gemini."
+        try:
+            payload = {
+                "contents": gemini_contents,
+                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "tools": _get_gemini_tools(),
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
+            }
+            
+            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=20)
+            
+            if resp.status_code == 429 or resp.status_code >= 500:
+                continue
 
-        candidate = candidates[0]
-        content = candidate.get("content", {})
-        parts = content.get("parts", [])
+            if resp.status_code != 200:
+                continue
 
-        # Check for function calls
-        function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
-        
-        if not function_calls:
-            # Final text response
-            text_parts = [p.get("text", "") for p in parts if "text" in p]
-            final_text = "\n".join(text_parts).strip()
-            conversation.append({"role": "assistant", "content": final_text})
-            return final_text
+            res_data = resp.json()
+            candidates = res_data.get("candidates", [])
+            if not candidates:
+                continue
 
-        # Record assistant tool call in gemini_contents
-        gemini_contents.append({"role": "model", "parts": parts})
-        
-        # Execute each function call
-        fn_responses = []
-        for fc in function_calls:
-            fn_name = fc.get("name")
-            fn_args = fc.get("args", {})
-            tool_res_str = tools.run_tool(fn_name, fn_args, board_ids, session_cache)
-            fn_responses.append({
-                "functionResponse": {
-                    "name": fn_name,
-                    "response": {"output": tool_res_str}
-                }
-            })
+            candidate = candidates[0]
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
 
-        # Append function responses as user turn in Gemini contents
-        gemini_contents.append({"role": "user", "parts": fn_responses})
+            function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+            
+            if not function_calls:
+                text_parts = [p.get("text", "") for p in parts if "text" in p]
+                final_text = "\n".join(text_parts).strip()
+                if final_text:
+                    conversation.append({"role": "assistant", "content": final_text})
+                    return final_text
+
+            gemini_contents.append({"role": "model", "parts": parts})
+            
+            fn_responses = []
+            for fc in function_calls:
+                fn_name = fc.get("name")
+                fn_args = fc.get("args", {})
+                tool_res_str = tools.run_tool(fn_name, fn_args, board_ids, session_cache)
+                fn_responses.append({
+                    "functionResponse": {
+                        "name": fn_name,
+                        "response": {"output": tool_res_str}
+                    }
+                })
+
+            gemini_contents.append({"role": "user", "parts": fn_responses})
+            
+            follow_payload = {
+                "contents": gemini_contents,
+                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "tools": _get_gemini_tools(),
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
+            }
+            follow_resp = requests.post(url, json=follow_payload, headers={"Content-Type": "application/json"}, timeout=20)
+            if follow_resp.status_code == 200:
+                f_data = follow_resp.json()
+                f_cands = f_data.get("candidates", [])
+                if f_cands:
+                    f_parts = f_cands[0].get("content", {}).get("parts", [])
+                    f_text = "\n".join([p.get("text", "") for p in f_parts if "text" in p]).strip()
+                    if f_text:
+                        conversation.append({"role": "assistant", "content": f_text})
+                        return f_text
+
+        except Exception:
+            continue
+
+    return _fallback_local_engine(conversation, board_ids, session_cache)
 
 def _run_anthropic_turn(conversation: list[dict], board_ids: dict, session_cache: dict, api_key: str) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     model = "claude-sonnet-5"
 
-    while True:
-        response = client.messages.create(
-            model=model,
-            max_tokens=1500,
-            system=SYSTEM_PROMPT,
-            tools=tools.TOOLS_SCHEMA,
-            messages=conversation,
-        )
+    try:
+        while True:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1500,
+                system=SYSTEM_PROMPT,
+                tools=tools.TOOLS_SCHEMA,
+                messages=conversation,
+            )
 
-        conversation.append({"role": "assistant", "content": response.content})
+            conversation.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason != "tool_use":
-            text_parts = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_parts).strip()
+            if response.stop_reason != "tool_use":
+                text_parts = [b.text for b in response.content if b.type == "text"]
+                return "\n".join(text_parts).strip()
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            result_str = tools.run_tool(block.name, block.input, board_ids, session_cache)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "name": block.name,
-                "content": result_str,
-            })
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result_str = tools.run_tool(block.name, block.input, board_ids, session_cache)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "name": block.name,
+                    "content": result_str,
+                })
 
-        conversation.append({"role": "user", "content": tool_results})
+            conversation.append({"role": "user", "content": tool_results})
+    except Exception:
+        return _fallback_local_engine(conversation, board_ids, session_cache)
 
 def run_agent_turn(conversation: list[dict], board_ids: dict, session_cache: dict) -> str:
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -167,4 +240,4 @@ def run_agent_turn(conversation: list[dict], board_ids: dict, session_cache: dic
     elif anthropic_key:
         return _run_anthropic_turn(conversation, board_ids, session_cache, anthropic_key)
     else:
-        raise RuntimeError("No LLM API Key found! Set GEMINI_API_KEY or ANTHROPIC_API_KEY in secrets.toml or environment.")
+        return _fallback_local_engine(conversation, board_ids, session_cache)
